@@ -1,0 +1,362 @@
+const express = require('express');
+const mysql = require('mysql2');
+const cors = require('cors');
+
+const app = express();
+
+// 🌟 PENTING: Aktifkan trust proxy agar Express bisa membaca IP asli client lewat Nginx/WireGuard
+app.set('trust proxy', true);
+
+// 🟢 1. CORS WAJIB DI TARUH DI SINI (PALING ATAS!)
+app.use(cors({
+  origin: '*', 
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// 🟢 2. BARU PASANG LIMIT JSON DI BAWAH CORS
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+// Koneksi ke Database menggunakan Pool
+const db = mysql.createPool({
+  host: '172.17.0.70',
+  user: 'kencana',
+  password: 'Kencana#123', // sesuaikan dengan password db anda
+  database: 'absensi',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// ✅ PERBAIKAN 1 & 2: Gunakan db.promise() untuk ekspor dan hapus db.connect() 
+// Kueri dasar untuk memastikan pool database berfungsi saat startup
+db.query('SELECT 1', (err) => {
+  if (err) {
+    console.error('Koneksi DB Gagal saat inisialisasi awal:', err.message);
+  } else {
+    console.log('Database Connection Pool siap digunakan!');
+  }
+});
+
+// ==========================================
+// MIDDLEWARE VALIDASI IP WIREGUARD (Ditaruh di atas sebelum route)
+// ==========================================
+const IP_WHITELIST = [
+  '172.17.0.98',   // Komputer Resepsionis
+  '172.17.0.196',   // Komputer Gudang
+  '127.0.0.1',  // Localhost (untuk testing internal server)
+  '::1'
+];
+
+const verifikasiIPWireGuard = (req, res, next) => {
+  let clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  
+  // Hilangkan prefiks IPv6 jika ada
+  if (clientIp && clientIp.includes('::ffff:')) {
+    clientIp = clientIp.split('::ffff:')[1];
+  }
+
+  // Validasi apakah IP client terdaftar di whitelist
+  if (IP_WHITELIST.includes(clientIp)) {
+    next(); // IP Cocok! Izinkan melakukan Absensi/Registrasi
+  } else {
+    return res.status(403).json({ 
+      success: false, 
+      message: `Akses Ditolak! Komputer Anda (${clientIp}) tidak terdaftar dalam jaringan absensi resmi.` 
+    });
+  }
+};
+
+// ==========================================
+// ENDPOINT SERVER TIME (Untuk sinkronisasi jam frontend)
+// ==========================================
+app.get('/api/server-time', (req, res) => {
+  res.json({ serverTime: new Date().getTime() });
+});
+
+// ==========================================
+// ENDPOINT REGISTRASI WAJAH (Diberi proteksi IP juga)
+// ==========================================
+app.post('/api/register', verifikasiIPWireGuard, (req, res) => {
+  const { nik, face_vektor } = req.body;
+
+  if (!nik || !face_vektor) {
+    return res.status(400).json({ message: "NIK atau Vektor Wajah tidak boleh kosong!" });
+  }
+
+  const checkKaryawanSql = `SELECT kar_nama nama FROM hrd2.tkaryawan WHERE kar_status_aktif=1 and kar_nik = ? LIMIT 1`;
+
+  db.query(checkKaryawanSql, [nik], (errCheck, rowsKaryawan) => {
+    if (errCheck) {
+      console.error("Error Check Karyawan:", errCheck);
+      return res.status(500).json({ message: "Gagal memeriksa data master karyawan" });
+    }
+
+    if (rowsKaryawan.length === 0) {
+      return res.status(404).json({ 
+        message: `Gagal Registrasi! NIK ${nik} tidak ditemukan di master data karyawan.` 
+      });
+    }
+
+    const namaResmiKaryawan = rowsKaryawan[0].nama;
+    const insertUserSql = `INSERT INTO tfacevector (nik, nama, face_vektor) VALUES (?, ?, ?)`;
+
+    db.query(insertUserSql, [nik, namaResmiKaryawan, JSON.stringify(face_vektor)], (insertErr, result) => {
+      if (insertErr) {
+        console.error("Error Insert Biometric:", insertErr);
+        if (insertErr.code === 'ER_DUP_ENTRY') {
+          return res.status(400).json({ message: `NIK ${nik} sudah merekam wajah sebelumnya!` });
+        }
+        return res.status(500).json({ message: "Gagal menyimpan profile biometrik wajah" });
+      }
+
+      return res.status(200).json({ 
+        message: `Profile biometrik wajah berhasil didaftarkan secara resmi!`,
+        detail: { nik, nama: namaResmiKaryawan }
+      });
+    });
+  });
+});
+
+// Endpoint Ambil Users (Data Biometrik Wajah)
+app.get('/api/users', (req, res) => {
+  db.query("SELECT nik, nama, face_vektor FROM tfacevector", (err, results) => {
+    if (err) return res.status(500).json({ error: err.message });
+    return res.json(results);
+  });
+});
+
+// ==========================================
+// ENDPOINT ABSENSI (SUDAH DI-FIX SINTAKSIS & DENGAN PROTEKSI IP)
+// ==========================================
+app.post('/api/absensi', verifikasiIPWireGuard, (req, res) => {
+  const { nik, checktype } = req.body;
+
+  if (!nik || !checktype) {
+    return res.status(400).json({ message: "Data tidak lengkap" });
+  }
+
+  const selectKaryawanSql = `SELECT kar_nama nama FROM hrd2.tkaryawan WHERE kar_status_aktif=1 and kar_nik = ? LIMIT 1`;
+
+  db.query(selectKaryawanSql, [nik], (errKaryawan, rowsKaryawan) => {
+    if (errKaryawan) {
+      console.error("Error Query Karyawan:", errKaryawan);
+      return res.status(500).json({ message: "Gagal memproses validasi database karyawan" });
+    }
+
+    if (rowsKaryawan.length === 0) {
+      return res.status(404).json({ message: "Karyawan tidak terdaftar atau tidak aktif!" });
+    }
+
+    const namaResmiKaryawan = rowsKaryawan[0].nama;
+
+    // 🛡️ KONDISI A: JIKA CHECK-IN (I)
+    if (checktype === 'I') {
+      const cekWaktuLamaSql = `
+        SELECT TIME_FORMAT(checktime, '%H:%i:%s') as jam_terakhir 
+        FROM tcheckinout 
+        WHERE nik = ? AND checktype = 'I' AND tanggal = CURDATE()
+        ORDER BY checktime DESC LIMIT 1
+      `;
+
+      db.query(cekWaktuLamaSql, [nik], (errWaktu, rowsWaktu) => {
+        if (errWaktu) return res.status(500).json({ message: "Gagal memeriksa riwayat absensi" });
+
+        if (rowsWaktu.length > 0) {
+          const jamTerakhirDiDB = rowsWaktu[0].jam_terakhir;
+          
+          db.query(`SELECT CURTIME() as jam_sekarang`, (errSkrg, rowsSkrg) => {
+            if (errSkrg || rowsSkrg.length === 0) return res.status(500).json({ message: "Gagal mengambil waktu" });
+
+            const jamSekarangServer = rowsSkrg[0].jam_sekarang;
+
+            if (jamSekarangServer > jamTerakhirDiDB) {
+              return res.status(422).json({ 
+                message: `Anda sudah melakukan Check-In pada pukul ${jamTerakhirDiDB}` 
+              });
+            } else {
+              eksekusiInsertAbsen(nik, namaResmiKaryawan, checktype, res);
+            }
+          });
+        } else {
+          eksekusiInsertAbsen(nik, namaResmiKaryawan, checktype, res);
+        }
+      });
+
+    // 🔄 KONDISI B: JIKA CHECK-OUT (O)
+    } else if (checktype === 'O') {
+      const cekOutLamaSql = `
+        SELECT id FROM tcheckinout 
+        WHERE nik = ? AND checktype = 'O' AND tanggal = CURDATE() 
+        LIMIT 1
+      `;
+
+      db.query(cekOutLamaSql, [nik], (errCekOut, rowsOut) => {
+        if (errCekOut) return res.status(500).json({ message: "Gagal memvalidasi log checkout" });
+
+        if (rowsOut.length > 0) {
+          const idLogLama = rowsOut[0].id;
+          const updateSql = `UPDATE tcheckinout SET checktime = CURTIME() WHERE id = ?`;
+
+          db.query(updateSql, [idLogLama], (updateErr) => {
+            if (updateErr) return res.status(500).json({ message: "Gagal memperbarui waktu Check-Out" });
+
+            db.query(`SELECT TIME_FORMAT(checktime, '%H:%i:%s') as jam_baru FROM tcheckinout WHERE id = ?`, [idLogLama], (errJam, rowsJam) => {
+              const jamFix = (!errJam && rowsJam.length > 0) ? rowsJam[0].jam_baru : "00:00:00";
+              return res.status(200).json({ 
+                message: "Check-Out Diperbarui (Jam Terbaru)!", 
+                detail: { nik, nama: namaResmiKaryawan, checktype, jam: jamFix }
+              });
+            });
+          });
+
+        } else {
+          eksekusiInsertAbsen(nik, namaResmiKaryawan, checktype, res);
+        }
+      });
+    }
+  });
+});
+
+// 📦 Fungsi Bantuan untuk Melakukan Insert ke Database
+function eksekusiInsertAbsen(nik, nama, checktype, res) {
+  const insertSql = `
+    INSERT INTO tcheckinout (nik, nama, tanggal, checktime, checktype) 
+    VALUES (?, ?, CURDATE(), CURTIME(), ?)
+  `;
+
+  db.query(insertSql, [nik, nama, checktype], (insertErr, result) => {
+    if (insertErr) {
+      console.error("Error Insert Absensi:", insertErr);
+      return res.status(500).json({ message: "Gagal menyimpan log absensi ke database" });
+    }
+
+    const selectWaktuSql = `
+      SELECT TIME_FORMAT(checktime, '%H:%i:%s') as jam_server 
+      FROM tcheckinout 
+      WHERE id = LAST_INSERT_ID()
+    `;
+
+    db.query(selectWaktuSql, (selectErr, rowsWaktu) => {
+      const jamFix = (!selectErr && rowsWaktu.length > 0) ? rowsWaktu[0].jam_server : "00:00:00";
+
+      return res.status(200).json({ 
+        message: "Absensi Berhasil!", 
+        detail: { nik, nama, checktype, jam: jamFix }
+      });
+    });
+  });
+}
+
+// ==========================================
+// ENDPOINT VALIDASI PASSWORD MODAL ADMIN
+// ==========================================
+app.post('/api/admin/verify-password', (req, res) => {
+  const { password } = req.body;
+  const PASSWORD_ADMIN_VALID = "admin123"; 
+
+  if (!password) {
+    return res.status(400).json({ auth: false, message: "Password tidak boleh kosong" });
+  }
+
+  if (password === PASSWORD_ADMIN_VALID) {
+    return res.status(200).json({ auth: true, message: "Akses diberikan" });
+  } else {
+    return res.status(401).json({ auth: false, message: "Password salah!" });
+  }
+});
+
+// ==========================================
+// 🌟 ENDPOINT BARU: AMBIL DAFTAR KARYAWAN AKTIF (UNTUK LOV)
+// ==========================================
+app.get('/api/karyawan', async (req, res) => {
+  try {
+    // 🌟 PERBAIKAN UTAMA: Menggunakan nama variabel variabel 'db' yang asli, serta dibungkus .promise() agar kompatibel dengan async/await
+    const [rows] = await db.promise().query(
+      'SELECT kar_nik nik, kar_nama nama FROM hrd2.tkaryawan WHERE kar_status_aktif = 1 ORDER BY kar_nama ASC'
+    );
+    
+    res.json(rows);
+  } catch (error) {
+    console.error('Error Query Karyawan:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Gagal mengambil data master karyawan dari database' 
+    });
+  }
+});
+
+
+// ==========================================
+// 🌟 ENDPOINT BARU: AMBIL DAFTAR WAJAH TERDAFTAR
+// ==========================================
+app.get('/api/facekaryawan', async (req, res) => {
+  try {
+    // 🌟 PERBAIKAN UTAMA: Menggunakan nama variabel variabel 'db' yang asli, serta dibungkus .promise() agar kompatibel dengan async/await
+    const [rows] = await db.promise().query(
+      `SELECT nik, nama, kar_pab_kode lokasi, if(kar_status_aktif=1,'Aktif','Nonaktif') status FROM absensi.tfacevector
+LEFT JOIN hrd2.tkaryawan ON kar_nik=nik order by nama`
+    );
+    
+    res.json(rows);
+  } catch (error) {
+    console.error('Error Query Karyawan:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Gagal mengambil data karyawan terdaftar' 
+    });
+  }
+});
+
+
+app.delete('/api/facekaryawan/:nik', async (req, res) => {
+  const { nik } = req.params; // Mengambil NIK dari URL parameter
+
+  // Validasi jika NIK kosong
+  if (!nik) {
+    return res.status(400).json({ 
+      success: false, 
+      message: 'Parameter NIK tidak boleh kosong' 
+    });
+  }
+
+  try {
+    // Jalankan query DELETE pada database absensi ke tabel tfacevector
+    const [result] = await db.promise().query(
+      'DELETE FROM absensi.tfacevector WHERE nik = ?', 
+      [nik]
+    );
+
+    // Cek apakah ada baris data yang terhapus
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: `Data biometrik dengan NIK ${nik} tidak ditemukan`
+      });
+    }
+
+    // Jika sukses terhapus
+    res.json({
+      success: true,
+      message: `Profil biometrik wajah NIK ${nik} berhasil dihapus dari sistem`
+    });
+
+  } catch (error) {
+    console.error('Error saat menghapus wajah:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Gagal menghapus data biometrik di server'
+    });
+  }
+});
+
+// ✅ PERBAIKAN 3: Sesuaikan port listen ke 8081 (Sesuai error log front-end Anda)
+const PORT = 8081;
+const HOST = '0.0.0.0';
+
+app.listen(PORT, HOST, () => {
+  console.log(`Server Kencana berjalan aktif!`);
+  console.log(`- Akses Lokal: http://localhost:${PORT}`);
+  console.log(`- Akses Server Jaringan: http://172.17.0.87:${PORT}`);
+});
