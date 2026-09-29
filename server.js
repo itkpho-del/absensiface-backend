@@ -21,9 +21,9 @@ app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Koneksi ke Database menggunakan Pool
 const db = mysql.createPool({
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || 'password', // sesuaikan dengan password db anda
+  host: process.env.DB_HOST || '172.17.0.70',
+  user: process.env.DB_USER || 'kencana',
+  password: process.env.DB_PASSWORD || 'Kencana#123', // sesuaikan dengan password db anda
   database: process.env.DB_NAME || 'absensi',
   waitForConnections: true,
   connectionLimit: 20,
