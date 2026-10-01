@@ -5,8 +5,79 @@ const cors = require('cors');
 
 const app = express();
 
-// 🌟 CATATAN: identitas IP diambil dari peer TCP asli (req.socket.remoteAddress),
-// bukan dari header X-Forwarded-For, agar selalu IP WireGuard klien yang tersimpan.
+// ==========================================
+// 🛡️ TRUSTED PROXY (WAJIB KALAU DI DEPAN ADA NGINX/APACHE)
+// ==========================================
+// Di server live, backend Express tidak diakses langsung oleh browser, melainkan
+// lewat reverse proxy (nginx/Apache) di host yang sama. Akibatnya
+// req.socket.remoteAddress SELALU berisi IP proxy itu sendiri (mis. 172.17.0.87),
+// bukan IP WireGuard komputer.
+// Forwarded-For yang disetel oleh proxy-lah yang memuat IP asli, jadi kita izinkan
+// Express membacanya — TAPI hanya untuk request yang datang dari proxy
+// terdaftar di bawah. Header dari klien biasa (yang bukan proxy) tetap diabaikan
+// sehingga IP tidak bisa dipalsukan dengan crafting header.
+//
+// Daftar IP proxy, pisahkan koma. HAPUS dari daftar ini kalau nama mesin/alamat
+// proxy berubah, karena kalau tidak cocok maka IP klien kembali terbaca sebagai
+// IP proxy dan absensi akan ditolak.
+const daftarProxyTepercaya = (process.env.TRUST_PROXY_IPS || 'loopback,172.17.0.87')
+  .split(',')
+  .map((ip) => ip.trim())
+  .filter(Boolean);
+
+app.set('trust proxy', daftarProxyTepercaya);
+console.log('Trusted proxy (boleh menyetor X-Forwarded-For):', daftarProxyTepercaya.join(', '));
+
+// 📥 Terjemahkan nama rentang (loopback) menjadi alamat konkret, karena
+// pengecekan peer di bawah memakai perbandingan biasa, bukan proxy-addr.
+// Contoh: 'loopback' -> 127.0.0.1 + ::1
+const PETA_NAMA_RENTANG = {
+  loopback: ['127.0.0.1', '::1'],
+  linklocal: ['169.254.0.0/16', 'fe80::/10'],
+};
+
+function alamatProxyTerpercaya() {
+  const hasil = [];
+  for (const item of daftarProxyTepercaya) {
+    const kunci = item.toLowerCase();
+    if (PETA_NAMA_RENTANG[kunci]) {
+      hasil.push(...PETA_NAMA_RENTANG[kunci]);
+    } else {
+      hasil.push(item);
+    }
+  }
+  return hasil;
+}
+
+function ipv4KeAngka(ip) {
+  const bagian = String(ip).split('.');
+  if (bagian.length !== 4) return null;
+  let nilai = 0;
+  for (const oktet of bagian) {
+    const angka = Number(oktet);
+    if (!Number.isInteger(angka) || angka < 0 || angka > 255) return null;
+    nilai = nilai * 256 + angka;
+  }
+  return nilai;
+}
+
+// 📦 Pencocokan alamat IP: IP persis (172.17.0.87), prefiks (172.17.0.),
+// atau CIDR (172.17.0.0/16).
+function ipDalamRentang(ip, rentang) {
+  if (rentang.includes('/')) {
+    const [jaringan, bits] = rentang.split('/');
+    const ipNum = ipv4KeAngka(ip);
+    const jaringNum = ipv4KeAngka(jaringan);
+    if (ipNum === null || jaringNum === null) return false;
+    const geser = 32 - Number(bits);
+    if (!Number.isInteger(geser) || geser < 0) return false;
+    return Math.floor(ipNum / 2 ** geser) === Math.floor(jaringNum / 2 ** geser);
+  }
+  if (rentang.endsWith('.')) {
+    return ip.startsWith(rentang);
+  }
+  return ip === rentang;
+}
 
 // 🟢 1. CORS WAJIB DI TARUH DI SINI (PALING ATAS!)
 app.use(cors({
@@ -39,17 +110,63 @@ db.query('SELECT 1', (err) => {
   }
 });
 
-// 🛡️ BANTUAN: Ambil IP peer TCP yang SEBENARNYA (req.socket.remoteAddress).
-// Di jaringan WireGuard ini persis IP WireGuard klien (mis. 172.17.x.x), bukan
-// alamat fisik LAN, dan tidak bisa dipalsukan lewat header.
-// Header X-Forwarded-For sengaja DIABAIKAN agar IP yang tercatat di
-// tcheckinout / tfacevector / log registrasi selalu IP WireGuard asli.
-function ambilIpKoneksi(req) {
-  let clientIp = req.socket.remoteAddress || req.connection.remoteAddress || '';
-  if (clientIp.includes('::ffff:')) {
-    clientIp = clientIp.split('::ffff:')[1];
+// 🛡️ BANTUAN: Ambil IP klien yang SEBENARNYA, baik lewat proxy maupun langsung.
+function normalisasiIp(ip) {
+  let bersih = (ip || '').trim();
+  if (bersih.startsWith('::ffff:')) {
+    bersih = bersih.slice('::ffff:'.length);
   }
-  return clientIp;
+  if (bersih === '::1') {
+    bersih = '127.0.0.1';
+  }
+  return bersih;
+}
+
+// Daftar alamat loopback. Proxy lokal (nginx/Apache) di mesin yang sama selalu
+// terlihat sebagai 127.0.0.1 atau ::1, apa pun nama host/IP yang dipakainya.
+const ALAMAT_LOOPBACK = ['127.0.0.1', '::1', '0.0.0.0'];
+
+// Apakah request ini datang dari proxy yang kita percaya? Kalau ya, header
+// proxy layak dibaca. Kalau tidak, header diabaikan sepenuhnya supaya IP tidak
+// bisa dipalsukan oleh klien mana pun.
+function peerAdalahProxyTerpercaya(req) {
+  const peer = normalisasiIp(req.socket?.remoteAddress);
+  return alamatProxyTerpercaya().some((rentang) => ipDalamRentang(peer, rentang));
+}
+
+function ambilIpKoneksi(req) {
+  const peer = normalisasiIp(req.socket?.remoteAddress);
+
+  // Tanpa proxy: peer TCP sudah pasti IP komputer_asli.
+  if (!peerAdalahProxyTerpercaya(req)) {
+    return peer;
+  }
+
+  // Lewat proxy. req.ip = hasil resolusi X-Forwarded-For oleh Express/proxy-addr:
+  // membaca dari kanan dan melewati HANYA alamat proxy, jadi entri XFF yang
+  // dipalsukan klien (bagian paling kiri) otomatis dibuang.
+  const dariXff = normalisasiIp(req.ip);
+  if (dariXff && dariXff !== peer) {
+    return dariXff;
+  }
+
+  // Sebagian config nginx hanya mengirim X-Real-IP (tanpa X-Forwarded-For),
+  // jadi dipakai sebagai cadangan selama peer-nya proxy terdaftar.
+  const dariXReal = normalisasiIp(req.headers['x-real-ip']);
+  if (dariXReal) {
+    return dariXReal;
+  }
+
+  return peer;
+}
+
+// 🩺 Bantu diagnosis saat IP ditolak: catat semua jejak IP supaya jelas masalahnya
+// di proxy (header tidak diteruskan) atau di database (IP tidak terdaftar).
+function catatDitolak(req, clientIp, middleware) {
+  console.warn(`[IP-DITOLAK:${middleware}] ip_terbaca=${clientIp} peer_tcp=${normalisasiIp(req.socket?.remoteAddress)} proxy_terpercaya=${peerAdalahProxyTerpercaya(req)} xff=${req.headers['x-forwarded-for'] || '-'} xreal=${req.headers['x-real-ip'] || '-'} host=${req.headers.host || '-'} path=${req.originalUrl}`);
+  if (peerAdalahProxyTerpercaya(req) && !req.headers['x-forwarded-for'] && !req.headers['x-real-ip']) {
+    console.warn('[IP-DITOLAK] Request datang dari proxy tapi TIDAK ADA header X-Forwarded-For maupun X-Real-IP -> IP asli tidak bisa diketahui. Perbaiki proxy_set_header di config nginx.');
+  }
 }
 
 // Kueri umum: cocokkan IP dengan kode pabrik/store
@@ -73,6 +190,7 @@ const verifikasiIPWireGuard = async (req, res, next) => {
       req.pabrikClient = pabrik;
       return next(); // IP Ditemukan! Izinkan akses ke controller.
     }
+    catatDitolak(req, clientIp, 'umum');
     return res.status(403).json({ 
       success: false, 
       message: `Akses Ditolak! Komputer Anda (${clientIp}) tidak terdaftar dalam jaringan absensi cabang resmi mana pun.` 
@@ -97,6 +215,7 @@ const verifikasiIPAbsensi = async (req, res, next) => {
       req.pabrikClient = pabrik;
       return next();
     }
+    catatDitolak(req, clientIp, 'absensi');
     return res.status(403).json({
       success: false,
       message: `Absensi Ditolak! IP (${clientIp}) tidak terdaftar di tabel tpabrik.`
@@ -677,11 +796,12 @@ app.get('/api/cabang', async (req, res) => {
   }
 });
 
-const PORT = 8081;
-const HOST = '0.0.0.0';
+const PORT = Number(process.env.PORT || 8081);
+const HOST = process.env.HOST || '0.0.0.0';
 
 app.listen(PORT, HOST, () => {
   console.log(`Server Kencana berjalan aktif!`);
   console.log(`- Akses Lokal: http://localhost:${PORT}`);
-  console.log(`- Akses Server Jaringan: http://172.17.0.87:${PORT}`);
+  console.log(`- Akses Server Jaringan: http://${process.env.SERVER_IP || '172.17.0.87'}:${PORT}`);
+  console.log(`- Endpoint terlindungi (butuh IP terdaftar di hrd2.tpabrik): /api/absensi, /api/register, /api/users-by-store`);
 });
