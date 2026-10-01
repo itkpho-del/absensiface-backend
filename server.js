@@ -178,6 +178,52 @@ async function cariPabrikDariIP(clientIp) {
     : null;
 }
 
+// ==========================================
+// ⚠️⚠️ MODE LEMBIR SEMENTARA (WASPADA) ⚠️⚠️
+// ==========================================
+// Aktif HANYA kalau IP benar-benar belum terdaftar atau proxy belum dikonfigurasi,
+// supaya absensi tetap bisa jalan. TIDAK untuk pemakaian rutin / produksi.
+// Cara pakai: set BYPASS_IP_CHECK=true di .env lalu restart backend.
+// MATIKAN lagi (hapus baris itu / set false) setelah jaringan beres.
+//
+// Kalau aktif, kode toko memakai LOCAL_STORE sebagai gantinya.
+const BYPASS_IP_CHECK = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.BYPASS_IP_CHECK || '').trim().toLowerCase()
+);
+const KODE_STORE_FALLBACK = (process.env.LOCAL_STORE || '').trim();
+
+if (BYPASS_IP_CHECK) {
+  console.warn('='.repeat(70));
+  console.warn('PERINGATAN: MODE LEMBIR AKTIF — verifikasi IP NONAKTIF!');
+  console.warn('Semua komputer bebas absen. Jangan dipakai di produksi.');
+  console.warn(`Kode toko fallback: ${KODE_STORE_FALLBACK || '(belum diisi di .env)'}`);
+  console.warn('='.repeat(70));
+}
+
+// 🔓 Cari identitas toko yang dipakai saat mode bypass aktif.
+async function tokoSaatBypass(clientIp) {
+  if (KODE_STORE_FALLBACK) {
+    const [rows] = await db.promise().query(
+      `SELECT pab_kode, pab_nama FROM hrd2.tpabrik WHERE pab_kode = ? LIMIT 1`,
+      [KODE_STORE_FALLBACK]
+    );
+    if (rows && rows.length > 0) {
+      return { pab_kode: rows[0].pab_kode, pab_nama: rows[0].pab_nama, clientIp, isLocal: true };
+    }
+    console.warn(`[BYPASS] Kode toko "${KODE_STORE_FALLBACK}" tidak ada di tpabrik, ambil daftar pertama.`);
+  }
+
+  // Tidak diisi / tidak ketemu: pakai toko pertama yang aktif supaya absensi
+  // tetap bisa jalan (data wajah & log IP tetap tercatat seperti biasa).
+  const [rows] = await db.promise().query(
+    `SELECT pab_kode, pab_nama FROM hrd2.tpabrik WHERE pab_status=1 AND pab_face='Y' ORDER BY pab_kode LIMIT 1`
+  );
+  if (rows && rows.length > 0) {
+    return { pab_kode: rows[0].pab_kode, pab_nama: rows[0].pab_nama, clientIp, isLocal: true };
+  }
+  throw new Error('Tidak ada satu pun toko aktif di hrd2.tpabrik');
+}
+
 // 🛡️ MIDDLEWARE VERIFIKASI IP & IDENTIFIKASI KODE PABRIK/STORE CLIENT
 // Dipakai untuk semua endpoint terproteksi. Identitas klien = IP WireGuard
 // (peer TCP asli) dan WAJIB terdaftar di hrd2.tpabrik — TIDAK ADA bypass localhost.
@@ -189,6 +235,10 @@ const verifikasiIPWireGuard = async (req, res, next) => {
     if (pabrik) {
       req.pabrikClient = pabrik;
       return next(); // IP Ditemukan! Izinkan akses ke controller.
+    }
+    if (BYPASS_IP_CHECK) {
+      req.pabrikClient = await tokoSaatBypass(clientIp);
+      return next(); // ⚠️ Mode bypass aktif: izinkan tanpa IP terdaftar.
     }
     catatDitolak(req, clientIp, 'umum');
     return res.status(403).json({ 
@@ -214,6 +264,10 @@ const verifikasiIPAbsensi = async (req, res, next) => {
     if (pabrik) {
       req.pabrikClient = pabrik;
       return next();
+    }
+    if (BYPASS_IP_CHECK) {
+      req.pabrikClient = await tokoSaatBypass(clientIp);
+      return next(); // ⚠️ Mode bypass aktif: izinkan tanpa IP terdaftar.
     }
     catatDitolak(req, clientIp, 'absensi');
     return res.status(403).json({
