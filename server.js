@@ -139,7 +139,7 @@ app.get('/api/users-by-store', verifikasiIPWireGuard, async (req, res) => {
         infoPabrikClient.pab_kode = lokalStoreOverride;
         infoPabrikClient.pab_nama = `Simulasi Toko ${lokalStoreOverride}`;
         query = `
-          SELECT tf.nik, tf.nama, tf.face_vektor, tf.kode_store 
+          SELECT tf.nik, tf.nama, tf.face_vektor 
           FROM absensi.tfacevector tf
           INNER JOIN hrd2.tkaryawan k ON k.kar_nik = tf.nik
           WHERE k.kar_status_aktif = 1 
@@ -148,7 +148,7 @@ app.get('/api/users-by-store', verifikasiIPWireGuard, async (req, res) => {
         params = [lokalStoreOverride];
       } else {
         query = `
-          SELECT tf.nik, tf.nama, tf.face_vektor, tf.kode_store 
+          SELECT tf.nik, tf.nama, tf.face_vektor 
           FROM absensi.tfacevector tf
         `;
       }
@@ -156,7 +156,7 @@ app.get('/api/users-by-store', verifikasiIPWireGuard, async (req, res) => {
       // Hanya muat data biometrik yang terdaftar di store lokasi komputer ini
       // DAN pastikan status karyawan di master HRD masih AKTIF di store tersebut
       query = `
-        SELECT tf.nik, tf.nama, tf.face_vektor, tf.kode_store 
+        SELECT tf.nik, tf.nama, tf.face_vektor 
         FROM absensi.tfacevector tf
         INNER JOIN hrd2.tkaryawan k ON k.kar_nik = tf.nik
         WHERE k.kar_status_aktif = 1 
@@ -187,7 +187,7 @@ app.get('/api/users-by-store', verifikasiIPWireGuard, async (req, res) => {
 // ==========================================
 // ENDPOINT REGISTRASI WAJAH (VALIDASI KODE STORE & IP)
 // ==========================================
-app.post('/api/register', verifikasiIPWireGuard, (req, res) => {
+app.post('/api/register', verifikasiIPWireGuard, async (req, res) => {
   const { nik, face_vektor, kode_pabrik } = req.body;
   const infoPabrikClient = req.pabrikClient;
 
@@ -203,22 +203,24 @@ app.post('/api/register', verifikasiIPWireGuard, (req, res) => {
     });
   }
 
-  // Ambil nama dan kar_pab_kode (sebagai kode_store) dari master karyawan
-  const checkKaryawanSql = `
-    SELECT kar_nama AS nama, kar_pab_kode AS kode_store 
-    FROM hrd2.tkaryawan 
-    WHERE kar_status_aktif = 1 
-      AND kar_nik = ? 
-      AND kar_pab_kode = ? 
-      AND kar_pab_kode IN (SELECT pab_kode FROM hrd2.tpabrik WHERE pab_face = 'Y') 
-    LIMIT 1
-  `;
+  try {
+    // Skema tfacevector bisa berbeda antara lokal & produksi (produksi tanpa
+    // kolom kode_store) → deteksi otomatis agar INSERT tetap aman.
+    const kolomTface = await kolomTfacevector();
+    const punyaKodeStore = kolomTface.includes('kode_store');
 
-  db.query(checkKaryawanSql, [nik, kode_pabrik], (errCheck, rowsKaryawan) => {
-    if (errCheck) {
-      console.error("Error Check Karyawan:", errCheck);
-      return res.status(500).json({ message: "Gagal memeriksa data master karyawan" });
-    }
+    // Ambil nama dan kar_pab_kode (sebagai kode_store) dari master karyawan
+    const checkKaryawanSql = `
+      SELECT kar_nama AS nama, kar_pab_kode AS kode_store 
+      FROM hrd2.tkaryawan 
+      WHERE kar_status_aktif = 1 
+        AND kar_nik = ? 
+        AND kar_pab_kode = ? 
+        AND kar_pab_kode IN (SELECT pab_kode FROM hrd2.tpabrik WHERE pab_face = 'Y') 
+      LIMIT 1
+    `;
+
+    const [rowsKaryawan] = await db.promise().query(checkKaryawanSql, [nik, kode_pabrik]);
 
     if (rowsKaryawan.length === 0) {
       return res.status(404).json({ 
@@ -229,31 +231,35 @@ app.post('/api/register', verifikasiIPWireGuard, (req, res) => {
     const namaResmiKaryawan = rowsKaryawan[0].nama;
     const kodeStore = rowsKaryawan[0].kode_store;
 
-    // Simpan NIK, Nama, Face Vektor, dan Kode Store ke tfacevector
-    const insertUserSql = `INSERT INTO tfacevector (nik, nama, face_vektor, kode_store) VALUES (?, ?, ?, ?)`;
+    // Simpan NIK, Nama, Face Vektor (+ Kode Store hanya bila kolomnya tersedia)
+    const insertUserSql = punyaKodeStore
+      ? `INSERT INTO tfacevector (nik, nama, face_vektor, kode_store) VALUES (?, ?, ?, ?)`
+      : `INSERT INTO tfacevector (nik, nama, face_vektor) VALUES (?, ?, ?)`;
+    const insertParams = punyaKodeStore
+      ? [nik, namaResmiKaryawan, JSON.stringify(face_vektor), kodeStore]
+      : [nik, namaResmiKaryawan, JSON.stringify(face_vektor)];
 
-    db.query(insertUserSql, [nik, namaResmiKaryawan, JSON.stringify(face_vektor), kodeStore], (insertErr) => {
-      if (insertErr) {
-        console.error("Error Insert Biometric:", insertErr);
-        if (insertErr.code === 'ER_DUP_ENTRY') {
-          return res.status(400).json({ message: `NIK ${nik} sudah merekam wajah sebelumnya!` });
-        }
-        return res.status(500).json({ message: "Gagal menyimpan profile biometrik wajah" });
+    await db.promise().query(insertUserSql, insertParams);
+
+    return res.status(200).json({ 
+      success: true,
+      message: `Profile biometrik wajah berhasil didaftarkan secara resmi!`,
+      detail: { 
+        nik, 
+        nama: namaResmiKaryawan, 
+        kode_pabrik, 
+        kode_store: kodeStore,
+        registered_from_ip: infoPabrikClient.clientIp 
       }
-
-      return res.status(200).json({ 
-        success: true,
-        message: `Profile biometrik wajah berhasil didaftarkan secara resmi!`,
-        detail: { 
-          nik, 
-          nama: namaResmiKaryawan, 
-          kode_pabrik, 
-          kode_store: kodeStore,
-          registered_from_ip: infoPabrikClient.clientIp 
-        }
-      });
     });
-  });
+
+  } catch (error) {
+    console.error("Error Registrasi Profile Biometric:", error);
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(400).json({ message: `NIK ${nik} sudah merekam wajah sebelumnya!` });
+    }
+    return res.status(500).json({ message: "Gagal menyimpan profile biometrik wajah" });
+  }
 });
 
 // ==========================================
@@ -392,6 +398,29 @@ app.post('/api/absensi', verifikasiIPAbsensi, (req, res) => {
 let kolomIPAbsen = null;
 let promiseKolomIP = null;
 
+// 📦 Deteksi kolom absensi.tfacevector (skema lokal vs produksi bisa beda:
+// produksi TIDAK punya kolom kode_store → query SELECT/INSERT dibuat dinamis)
+let daftarKolomTface = null;
+let promiseKolomTface = null;
+
+function kolomTfacevector() {
+  if (!promiseKolomTface) {
+    const cekSql = `
+      SELECT COLUMN_NAME FROM information_schema.COLUMNS 
+      WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tfacevector'
+    `;
+
+    promiseKolomTface = new Promise((resolve) => {
+      db.query(cekSql, (err, rows) => {
+        daftarKolomTface = (err || !rows) ? [] : rows.map((r) => r.COLUMN_NAME);
+        console.log('Kolom tfacevector terdeteksi:', daftarKolomTface.join(', ') || '(kosong)');
+        resolve(daftarKolomTface);
+      });
+    });
+  }
+  return promiseKolomTface;
+}
+
 function ambilKolomIP() {
   if (!promiseKolomIP) {
     const cekSql = `
@@ -503,7 +532,7 @@ app.get('/api/karyawan', async (req, res) => {
 app.get('/api/facekaryawan', async (req, res) => {
   try {
     const [rows] = await db.promise().query(
-      `SELECT tf.nik, tf.nama, tf.kode_store, kar_pab_kode lokasi, if(kar_status_aktif=1,'Aktif','Nonaktif') status FROM absensi.tfacevector tf LEFT JOIN hrd2.tkaryawan ON kar_nik=tf.nik order by tf.nama`
+      `SELECT tf.nik, tf.nama, ifnull(kar_pab_kode,'') kode_store, kar_pab_kode lokasi, if(kar_status_aktif=1,'Aktif','Nonaktif') status FROM absensi.tfacevector tf LEFT JOIN hrd2.tkaryawan ON kar_nik=tf.nik order by tf.nama`
     );
     res.json(rows);
   } catch (error) {

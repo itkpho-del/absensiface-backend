@@ -2,3 +2,4 @@ Server Kencana berjalan aktif!
 - Akses Lokal: http://localhost:8081
 - Akses Server Jaringan: http://172.17.0.87:8081
 Database Connection Pool siap digunakan!
+Kolom IP tcheckinout terdeteksi: (tidak ada, IP di-skip)
