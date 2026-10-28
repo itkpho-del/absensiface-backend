@@ -384,7 +384,7 @@ app.post('/api/register', verifikasiIPWireGuard, async (req, res) => {
 
     // Ambil nama dan kar_pab_kode (sebagai kode_store) dari master karyawan
     const checkKaryawanSql = `
-      SELECT kar_nama AS nama, kar_pab_kode AS kode_store 
+      SELECT kar_nama AS nama, kar_pab_kode AS kode_store, kar_pab_kode AS kode_pabrik
       FROM hrd2.tkaryawan 
       WHERE kar_status_aktif = 1 
         AND kar_nik = ? 
@@ -401,8 +401,8 @@ app.post('/api/register', verifikasiIPWireGuard, async (req, res) => {
       });
     }
 
-    const namaResmiKaryawan = rowsKaryawan[0].nama;
-    const kodeStore = rowsKaryawan[0].kode_store;
+    const namaResmiKaryawan = rowsKaryawan[0].nama || rowsKaryawan[0].kar_nama;
+    const kodeStore = rowsKaryawan[0].kode_pabrik || rowsKaryawan[0].kar_pab_kode || rowsKaryawan[0].kode_store || kode_pabrik;
 
     // Simpan NIK, Nama, Face Vektor (+ Kode Store hanya bila kolomnya tersedia)
     const insertUserSql = punyaKodeStore
