@@ -407,10 +407,10 @@ app.post('/api/register', verifikasiIPWireGuard, async (req, res) => {
     // Simpan NIK, Nama, Face Vektor (+ Kode Store hanya bila kolomnya tersedia)
     const insertUserSql = punyaKodeStore
       ? `INSERT INTO tfacevector (nik, nama, face_vektor, kode_store) VALUES (?, ?, ?, ?)`
-      : `INSERT INTO tfacevector (nik, nama, face_vektor) VALUES (?, ?, ?)`;
+      : `INSERT INTO tfacevector (nik, nama, face_vektor, kode_store) VALUES (?, ?, ?, ?)`;
     const insertParams = punyaKodeStore
       ? [nik, namaResmiKaryawan, JSON.stringify(face_vektor), kodeStore]
-      : [nik, namaResmiKaryawan, JSON.stringify(face_vektor)];
+      : [nik, namaResmiKaryawan, JSON.stringify(face_vektor), kodeStore];
 
     await db.promise().query(insertUserSql, insertParams);
 
@@ -732,7 +732,7 @@ app.delete('/api/facekaryawan/:nik', verifikasiIPWireGuard, async (req, res) => 
 
   try {
     const [result] = await db.promise().query(
-      'DELETE FROM absensi.tfacevector WHERE nik = ?', 
+      'DELETE FROM absensi.tfacevector WHERE nik = ?',
       [nik]
     );
 
